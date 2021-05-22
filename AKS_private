@@ -1,3 +1,13 @@
+kured : gracefool time period for pod delete
+Host: www.prabhat.com >> External ip of Ingress controller mapped in domain.
+terraform :"
+add resource : add isliye use krta haii taaki hum kisi or terraform resource ko koi or Teraform resource use kre. (for example aapne DB and keyvault dono terraform say provision liye hoo and aapko DB waale teraform may pwd chaye hoo toh aap Key vault waaale ko associate kr logay by using add "reource ")
+null_resource :- koi v command direct chalana hoo toh
+local-exec:-  koi v command locally system may run hoo but effect server pay hoo means aap helm install locally pay run karte hoo but install cluster pay kr deta haii
+ # private_cluster_enabled = true
+ #  enable_auto_scaling = true
+
+for ex :- 
 resource "azurerm_kubernetes_cluster" "att-canopy-aks" {
   name                = "att-canopy-aks"
   kubernetes_version  = var.kubernetes_version
