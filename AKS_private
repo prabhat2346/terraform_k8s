@@ -1,0 +1,34 @@
+resource "azurerm_kubernetes_cluster" "att-canopy-aks" {
+  name                = "att-canopy-aks"
+  kubernetes_version  = var.kubernetes_version
+  resource_group_name = azurerm_resource_group.canopy.name
+  location            = azurerm_resource_group.canopy.location
+  dns_prefix          = "att-canopy-aks"
+  private_cluster_enabled = true
+  role_based_access_control {
+    enabled = true
+  }
+  addon_profile {
+    kube_dashboard {
+      enabled = true
+    }
+    http_application_routing {
+      enabled = true
+    }
+    azure_policy {
+      enabled = true
+    }
+  }
+    
+
+  default_node_pool {
+    name                = "system"
+    node_count          = var.system_node_count
+    vm_size             = "Standard_D4as_v4"
+    type                = "VirtualMachineScaleSets"
+    vnet_subnet_id      = azurerm_subnet.test.id
+    availability_zones  = [1, 2, 3]
+    enable_auto_scaling = true
+    min_count           = 1
+    max_count           = 8
+  }
