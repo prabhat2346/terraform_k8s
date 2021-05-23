@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hadoop.fullname" . }}-datanode
+  labels:
+    app: {{ include "hadoop.name" . }}
+    chart: {{ include "hadoop.chart" . }}
+    release: {{ .Release.Name }}
+    component: datanode
+spec:
+  clusterIP: "None"
+  ports:
+  - name: http
+    port: 9864
+  - name: https
+    port: 9865
+  - name: datanode
+    port: 9866
+  - name: ipc
+    port: 9867
+{{- if eq .Values.jmxExporter.dataNode.jmx_disable false }}
+  - name: jmx-metrics
+    port: {{ .Values.jmxExporter.Port }}
+    protocol: TCP
+    targetPort: {{ .Values.jmxExporter.Port }}
+{{- end}}
+  selector:
+    app: {{ template "hadoop.name" . }}
+    release: {{ .Release.Name }}
+    component: datanode

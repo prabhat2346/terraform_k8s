@@ -1,0 +1,25 @@
+{{- if eq .Values.jmxExporter.nameNode.jmx_disable false }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "config-volume-fullname" . }}-namenode-jmx-exporter
+  labels:
+    app.kubernetes.io/name: {{ include "hadoop.name" . }}
+    helm.sh/chart: {{ include "hadoop.chart" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  jmx_exporter_config.yaml: |
+    startDelaySeconds: {{ .Values.jmxExporter.nameNode.env.START_DELAY_SECONDS }}
+    hostPort: {{ .Values.jmxExporter.nameNode.env.HOSTPORT }}
+    username: {{ .Values.jmxExporter.nameNode.env.USERNAME }}
+    password: {{ .Values.jmxExporter.nameNode.env.PASSWORD }}
+    ssl: {{ .Values.jmxExporter.nameNode.env.SSL }}
+    lowercaseOutputName: {{ .Values.jmxExporter.nameNode.env.LOWERCASE_OUTPUT_NAME }}
+    lowercaseOutputLabelNames: {{ .Values.jmxExporter.nameNode.env.LOWERCASE_OUTPUT_LABEL_NAMES }}
+    whitelistObjectNames: {{ .Values.jmxExporter.nameNode.env.WHITELIST_OBJECT_NAMES }}
+    blacklistObjectNames: {{ .Values.jmxExporter.nameNode.env.BLACKLIST_OBJECT_NAMES }}
+    {{- if .Values.jmxExporter.nameNode.env.RULES }}
+    rules: {{ .Values.jmxExporter.nameNode.env.RULES }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hadoop.fullname" . }}-journalnode
+  labels:
+    app: {{ include "hadoop.name" . }}
+    chart: {{ include "hadoop.chart" . }}
+    release: {{ .Release.Name }}
+    component: journalnode
+spec:
+  clusterIP: "None"
+  ports:
+  - name: http
+    port: 8480
+  - name: https
+    port: 8481
+  - name: rpc
+    port: 8485
+{{- if eq .Values.jmxExporter.journalNode.jmx_disable false }}
+  - name: jmx-metrics
+    port: {{ .Values.jmxExporter.Port }}
+    protocol: TCP
+    targetPort: {{ .Values.jmxExporter.Port }}
+{{- end}}
+  selector:
+    app: {{ template "hadoop.name" . }}
+    release: {{ .Release.Name }}
+    component: journalnode

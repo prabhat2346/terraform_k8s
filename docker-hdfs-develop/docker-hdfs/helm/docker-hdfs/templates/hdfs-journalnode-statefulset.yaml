@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "hadoop.fullname" . }}-journalnode
+  annotations:
+    checksum/config: {{ include (print $.Template.BasePath "/hadoop-configmap.yaml") . | sha256sum }}
+  labels:
+    app: {{ template "hadoop.name" . }}
+    chart: {{ include "hadoop.chart" . }}
+    release: {{ .Release.Name }}
+    component: journalnode
+spec:
+  serviceName: {{ include "hadoop.fullname" . }}-journalnode
+  podManagementPolicy: Parallel
+  replicas: {{ .Values.highAvailability.journalnodeQuorumSize }}
+  selector:
+    matchLabels:
+      app: {{ include "hadoop.name" . }}
+      release: {{ .Release.Name }}
+      component: journalnode
+  template:
+    metadata:
+      labels:
+        app: {{ template "hadoop.name" . }}
+        release: {{ .Release.Name }}
+        component: journalnode
+      annotations:
+    {{- if eq .Values.jmxExporter.journalNode.jmx_disable false }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.jmxExporter.Port }}"
+    {{- end}}
+    spec:
+      subdomain: {{ include "hadoop.fullname" . }}-journalnode
+      {{- if eq .Values.antiAffinity "hard" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: "kubernetes.io/hostname"
+            labelSelector:
+              matchLabels:
+                app:  {{ template "hadoop.name" . }}
+                release: {{ .Release.Name | quote }}
+                component: journalnode
+      {{- else if eq .Values.antiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 5
+            podAffinityTerm:
+              topologyKey: "kubernetes.io/hostname"
+              labelSelector:
+                matchLabels:
+                  app:  {{ template "hadoop.name" . }}
+                  release: {{ .Release.Name | quote }}
+                  component: journalnode
+      {{- end }}
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: journalnode
+          image: {{ .Values.image }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          command:
+          - "/bin/bash"
+          - "/tmp/hadoop-config/bootstrap.sh"
+          - "-d"
+          ports:
+          - name: http
+            containerPort: 8480
+          - name: https
+            containerPort: 8481
+          - name: rpc
+            containerPort: 8485
+          livenessProbe:
+              httpGet:
+                path: /
+                port: http
+              initialDelaySeconds: 120
+              periodSeconds: 5
+              timeoutSeconds: 3
+          resources:
+{{ toYaml .Values.journalNode.resources | indent 12 }}
+          env:
+          - name: JOURNALNODE_JMX_DISABLE
+            value: {{ .Values.jmxExporter.journalNode.jmx_disable | quote }}
+          volumeMounts:
+            - name: editdir
+              mountPath: /usr/local/hadoop/hdfs
+              subPath: journal
+            - name: hadoop-config
+              mountPath: /tmp/hadoop-config
+      {{- if eq .Values.jmxExporter.journalNode.jmx_disable false }}
+        - image: "{{ .Values.jmxExporter.image.repository }}:{{ .Values.jmxExporter.image.tag }}"
+          imagePullPolicy: {{ .Values.jmxExporter.imagePullPolicy }}
+          name: jmx-exporter
+          ports:
+          - containerPort: {{ .Values.jmxExporter.Port }}
+            name: jmx-metrics
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /opt/jmx_exporter/config.yml
+            name: jmx-exporter-configmap-volume
+            subPath: config.yml
+      {{- end}}
+      restartPolicy: Always
+      volumes:
+      - name: hadoop-config
+        configMap:
+          name: {{ template "config-volume-fullname" . }}-hadoop
+    {{- if eq .Values.jmxExporter.journalNode.jmx_disable false }}
+      - configMap:
+          items:
+          - key: jmx_exporter_config.yaml
+            path: config.yml
+          name: {{ template "config-volume-fullname" . }}-journalnode-jmx-exporter
+        name: jmx-exporter-configmap-volume
+    {{- end}}
+      {{- if .Values.persistence.journalNode.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: editdir
+      spec:
+        accessModes: [{{ .Values.persistence.journalNode.accessMode | quote }}]
+        storageClassName: {{ .Values.persistence.journalNode.storageClass | quote }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.journalNode.size | quote }}
+      {{- else }}
+      - name: editdir
+        emptyDir: {}
+      {{- end }}

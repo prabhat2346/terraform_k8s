@@ -1,0 +1,156 @@
+ConfigVolume:
+  Name: hdfs
+
+# Ranger plugin config
+Ranger:
+  Enabled: false
+  Host: hadoop-ra-ranger-admin
+  Port: 6080
+  RepositoryName: HdfsAks
+  Auditing:
+    SummaryEnabled: false
+    Zookeeper:
+      Host: hadoop-sl-zookeeper-headless
+      Port: 2181
+    # auditing to solr
+    Solr:
+      Enabled: true
+      Host: hadoop-sl-solr-headless
+      Port: 8983
+    # auditing to hdfs
+    Hdfs:
+      Enabled: true
+
+# Select anitAffinity as either hard or soft, default is hard
+antiAffinity: "soft"
+
+LogLevel: INFO
+
+image: globaldevopsreg11.azurecr.io/docker-hdfs:0.0.0
+imagePullPolicy: IfNotPresent
+enableDfsPermissions: true
+enableHadoopAcls: false
+
+highAvailability:
+  Enabled: true
+  defaultAffinityEnabled: true
+  journalnodeQuorumSize: 3
+  Zookeeper:
+    Host: hadoop-sl-zookeeper-headless
+    Port: 2181
+
+nameNode:
+  pdbMinAvailable: 1
+  resources:
+    requests:
+      memory: "1024Mi"
+      cpu: "1000m"
+    limits:
+      memory: "1024Mi"
+      cpu: "1000m"
+
+dataNode:
+  replicas: 6
+  pdbMinAvailable: 5
+  resources:
+    requests:
+      memory: "4096Mi"
+      cpu: "2000m"
+    limits:
+      memory: "4096Mi"
+      cpu: "2000m"
+
+journalNode:
+  pdbMinAvailable: 2
+  resources:
+    requests:
+      memory: "1024Mi"
+      cpu: "500m"
+    limits:
+      memory: "1024Mi"
+      cpu: "500m"
+
+httpFs:
+  replicas: 3
+  pdbMinAvailable: 2
+  resources:
+    requests:
+      memory: "1024Mi"
+      cpu: "500m"
+    limits:
+      memory: "1024Mi"
+      cpu: "500m"
+
+persistence:
+  nameNode:
+    enabled: false
+    storageClass: azurefile-shared
+    accessMode: ReadWriteOnce
+    size: 50Gi
+
+  dataNode:
+    enabled: false
+    storageClass: azurefile-shared
+    accessMode: ReadWriteOnce
+    size: 200Gi
+
+  journalNode:
+    enabled: false
+    storageClass: azurefile-shared
+    accessMode: ReadWriteOnce
+    size: 10Gi
+
+  httpFs:
+    enabled: false
+    storageClass: azurefile-shared
+    accessMode: ReadWriteOnce
+    size: 10Gi
+
+jmxExporter:
+  image:
+    repository: globaldevopsreg11.azurecr.io/jmx-exporter
+    tag: 0.0.0
+  imagePullPolicy: IfNotPresent
+  Port: 5556
+  dataNode:
+    jmx_disable: false
+    env:
+      START_DELAY_SECONDS: 0
+      HOSTPORT: "127.0.0.1:1027"
+      USERNAME: ""
+      PASSWORD: ""
+      JMX_URL: ""
+      SSL: false
+      LOWERCASE_OUTPUT_NAME: true
+      LOWERCASE_OUTPUT_LABEL_NAMES: true
+      WHITELIST_OBJECT_NAMES: "['*:*']"
+      BLACKLIST_OBJECT_NAMES: []
+      RULES: ""
+  nameNode:
+    jmx_disable: false
+    env:
+      START_DELAY_SECONDS: 0
+      HOSTPORT: "127.0.0.1:1026"
+      USERNAME: ""
+      PASSWORD: ""
+      JMX_URL: ""
+      SSL: false
+      LOWERCASE_OUTPUT_NAME: true
+      LOWERCASE_OUTPUT_LABEL_NAMES: true
+      WHITELIST_OBJECT_NAMES: "['*:*']"
+      BLACKLIST_OBJECT_NAMES: []
+      RULES: ""
+  journalNode:
+    jmx_disable: false
+    env:
+      START_DELAY_SECONDS: 0
+      HOSTPORT: "127.0.0.1:1028"
+      USERNAME: ""
+      PASSWORD: ""
+      JMX_URL: ""
+      SSL: false
+      LOWERCASE_OUTPUT_NAME: true
+      LOWERCASE_OUTPUT_LABEL_NAMES: true
+      WHITELIST_OBJECT_NAMES: "['*:*']"
+      BLACKLIST_OBJECT_NAMES: []
+      RULES: ""

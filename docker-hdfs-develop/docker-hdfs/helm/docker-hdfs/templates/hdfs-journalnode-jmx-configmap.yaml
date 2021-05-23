@@ -1,0 +1,25 @@
+{{- if eq .Values.jmxExporter.journalNode.jmx_disable false }} 
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "config-volume-fullname" . }}-journalnode-jmx-exporter
+  labels:
+    app.kubernetes.io/name: {{ include "hadoop.name" . }}
+    helm.sh/chart: {{ include "hadoop.chart" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  jmx_exporter_config.yaml: |
+    startDelaySeconds: {{ .Values.jmxExporter.journalNode.env.START_DELAY_SECONDS }}
+    hostPort: {{ .Values.jmxExporter.journalNode.env.HOSTPORT }}
+    username: {{ .Values.jmxExporter.journalNode.env.USERNAME }}
+    password: {{ .Values.jmxExporter.journalNode.env.PASSWORD }}
+    ssl: {{ .Values.jmxExporter.journalNode.env.SSL }}
+    lowercaseOutputName: {{ .Values.jmxExporter.journalNode.env.LOWERCASE_OUTPUT_NAME }}
+    lowercaseOutputLabelNames: {{ .Values.jmxExporter.journalNode.env.LOWERCASE_OUTPUT_LABEL_NAMES }}
+    whitelistObjectNames: {{ .Values.jmxExporter.journalNode.env.WHITELIST_OBJECT_NAMES }}
+    blacklistObjectNames: {{ .Values.jmxExporter.journalNode.env.BLACKLIST_OBJECT_NAMES }}
+    {{- if .Values.jmxExporter.journalNode.env.RULES }}
+    rules: {{ .Values.jmxExporter.journalNode.env.RULES }}
+    {{- end }}
+{{- end }}

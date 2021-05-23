@@ -1,0 +1,23 @@
+FROM globaldevopsreg11.azurecr.io/docker-hadoop:0.0.7
+
+ARG RANGER_VERSION=2.0.0
+
+RUN sudo mkdir -p /usr/local/ranger-hdfs-plugin
+RUN sudo chown $HADOOP_USER_NAME:$HADOOP_USER_NAME /usr/local/ranger-hdfs-plugin
+
+COPY tar/ranger-hdfs-plugin-${RANGER_VERSION}.tar.gz /usr/local/hadoop/
+
+RUN sudo mkdir /external_deps
+RUN sudo chown $HADOOP_USER_NAME:$HADOOP_USER_NAME /external_deps
+COPY tar/tez-0.9.1.tar.gz /external_deps/
+
+RUN tar -xzvf ranger-hdfs-plugin-${RANGER_VERSION}.tar.gz --strip 1 -C /usr/local/ranger-hdfs-plugin/ \
+    && rm -rf ranger-hdfs-plugin-${RANGER_VERSION}.tar.gz
+
+RUN cd /usr/local/ranger-hdfs-plugin/lib/ \
+    && wget https://repo1.maven.org/maven2/com/kstruct/gethostname4j/0.0.2/gethostname4j-0.0.2.jar \
+    && wget https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.2.0/jna-5.2.0.jar \
+    && wget https://repo1.maven.org/maven2/commons-codec/commons-codec/1.12/commons-codec-1.12.jar \
+    && wget https://repo1.maven.org/maven2/commons-lang/commons-lang/2.6/commons-lang-2.6.jar
+
+EXPOSE 9000 9864 9870

@@ -1,0 +1,148 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "hadoop.fullname" . }}-namenode
+  annotations:
+    checksum/config: {{ include (print $.Template.BasePath "/hadoop-configmap.yaml") . | sha256sum }}
+  labels:
+    app: {{ include "hadoop.name" . }}
+    chart: {{ include "hadoop.chart" . }}
+    release: {{ .Release.Name }}
+    component: namenode
+spec:
+  serviceName: {{ include "hadoop.fullname" . }}-namenode
+  podManagementPolicy: Parallel
+  replicas: 2
+  selector:
+    matchLabels:
+      app: {{ include "hadoop.name" . }}
+      release: {{ .Release.Name }}
+      component: namenode
+  template:
+    metadata:
+      labels:
+        app: {{ template "hadoop.name" . }}
+        release: {{ .Release.Name }}
+        component: namenode
+      annotations:
+    {{- if eq .Values.jmxExporter.nameNode.jmx_disable false }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.jmxExporter.Port }}"
+    {{- end}}
+    spec:
+      subdomain: {{ include "hadoop.fullname" . }}-namenode
+      {{- if eq .Values.antiAffinity "hard" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: "kubernetes.io/hostname"
+            labelSelector:
+              matchLabels:
+                app:  {{ template "hadoop.name" . }}
+                release: {{ .Release.Name | quote }}
+                component: namenode
+      {{- else if eq .Values.antiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 5
+            podAffinityTerm:
+              topologyKey: "kubernetes.io/hostname"
+              labelSelector:
+                matchLabels:
+                  app:  {{ template "hadoop.name" . }}
+                  release: {{ .Release.Name | quote }}
+                  component: namenode
+      {{- end }}
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: namenode
+          image: {{ .Values.image }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          command:
+            - "/bin/bash"
+            - "/tmp/hadoop-config/bootstrap.sh"
+            - "-d"
+          ports:
+          - name: namenode
+            containerPort: 9000
+          - name: http
+            containerPort: 9870
+          livenessProbe:
+              httpGet:
+                path: /
+                port: http
+              initialDelaySeconds: 600
+              periodSeconds: 5
+              timeoutSeconds: 3
+          resources:
+{{ toYaml .Values.nameNode.resources | indent 12 }}
+          env:
+          - name: RANGER_ENABLED
+            value: "{{ .Values.Ranger.Enabled }}"
+          - name: MULTIHOMED_NETWORK
+            value: "0"
+          # Used by the start script below.
+          - name: MY_POD
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: NAMENODE_POD_0
+            value: {{ template "namenode-pod-0" . }}
+          - name: NAMENODE_POD_1
+            value: {{ template "namenode-pod-1" . }}
+          - name: NAMENODE_JMX_DISABLE
+            value: {{ .Values.jmxExporter.nameNode.jmx_disable | quote }}
+          volumeMounts:
+          - name: ranger-plugin-vol
+            mountPath: /usr/local/ranger-hdfs-plugin/install.properties
+            subPath: install.properties
+          - name: hadoop-config
+            mountPath: /tmp/hadoop-config
+          - name: metadatadir
+            mountPath: /usr/local/hadoop/hdfs
+      {{- if eq .Values.jmxExporter.nameNode.jmx_disable false }}
+        - image: "{{ .Values.jmxExporter.image.repository }}:{{ .Values.jmxExporter.image.tag }}"
+          imagePullPolicy: {{ .Values.jmxExporter.imagePullPolicy }}      
+          name: jmx-exporter
+          ports:
+          - containerPort: {{ .Values.jmxExporter.Port }}
+            name: jmx-metrics
+            protocol: TCP
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /opt/jmx_exporter/config.yml
+            name: jmx-exporter-configmap-volume
+            subPath: config.yml
+      {{- end}}
+      volumes:
+      - name: ranger-plugin-vol
+        configMap:
+          name: {{ template "config-volume-fullname" . }}-ranger-plugin
+      - name: hadoop-config
+        configMap:
+          name: {{ template "config-volume-fullname" . }}-hadoop
+    {{- if eq .Values.jmxExporter.nameNode.jmx_disable false }}
+      - configMap:
+          items:
+          - key: jmx_exporter_config.yaml
+            path: config.yml
+          name: {{ template "config-volume-fullname" . }}-namenode-jmx-exporter
+        name: jmx-exporter-configmap-volume
+    {{- end}}
+      {{- if .Values.persistence.nameNode.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: metadatadir
+      spec:
+        accessModes: [{{ .Values.persistence.nameNode.accessMode | quote }}]
+        storageClassName: {{ .Values.persistence.nameNode.storageClass | quote }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.nameNode.size | quote }}
+      {{- else }}
+      - name: metadatadir
+        emptyDir: {}
+      {{- end }}

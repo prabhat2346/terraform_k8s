@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "hadoop.fullname" . }}-httpfs
+  annotations:
+    checksum/config: {{ include (print $.Template.BasePath "/hadoop-configmap.yaml") . | sha256sum }}
+  labels:
+    app: {{ template "hadoop.name" . }}
+    chart: {{ include "hadoop.chart" . }}
+    release: {{ .Release.Name }}
+    component: httpfs
+spec:
+  serviceName: {{ include "hadoop.fullname" . }}-httpfs
+  podManagementPolicy: Parallel
+  replicas: {{ .Values.httpFs.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "hadoop.name" . }}
+      release: {{ .Release.Name }}
+      component: httpfs
+  template:
+    metadata:
+      labels:
+        app: {{ template "hadoop.name" . }}
+        release: {{ .Release.Name }}
+        component: httpfs
+    spec:
+      subdomain: {{ include "hadoop.fullname" . }}-httpfs
+      {{- if eq .Values.antiAffinity "hard" }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: "kubernetes.io/hostname"
+            labelSelector:
+              matchLabels:
+                app:  {{ template "hadoop.name" . }}
+                release: {{ .Release.Name | quote }}
+                component: httpfs
+      {{- else if eq .Values.antiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 5
+            podAffinityTerm:
+              topologyKey: "kubernetes.io/hostname"
+              labelSelector:
+                matchLabels:
+                  app:  {{ template "hadoop.name" . }}
+                  release: {{ .Release.Name | quote }}
+                  component: httpfs
+      {{- end }}
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: httpfs
+          image: {{ .Values.image }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          command:
+          - "/bin/bash"
+          - "/tmp/hadoop-config/bootstrap.sh"
+          - "-d"
+          ports:
+          - name: http
+            containerPort: 14000
+          livenessProbe:
+              httpGet:
+                path: /webhdfs/v1/?op=LISTSTATUS&user.name=hadoop
+                port: http
+              initialDelaySeconds: 120
+              periodSeconds: 10
+              timeoutSeconds: 5
+          resources:
+{{ toYaml .Values.httpFs.resources | indent 12 }}
+          volumeMounts:
+            - name: httpfsdir
+              mountPath: /usr/local/hadoop/httpfs
+              subPath: journal
+            - name: hadoop-config
+              mountPath: /tmp/hadoop-config
+      restartPolicy: Always
+      volumes:
+      - name: hadoop-config
+        configMap:
+          name: {{ template "config-volume-fullname" . }}-hadoop
+      {{- if .Values.persistence.httpFs.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: httpfsdir
+      spec:
+        accessModes: [{{ .Values.persistence.httpFs.accessMode | quote }}]
+        storageClassName: {{ .Values.persistence.httpFs.storageClass | quote }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.httpFs.size | quote }}
+      {{- else }}   
+      - name: httpfsdir 
+        emptyDir: {}
+      {{- end }}
+

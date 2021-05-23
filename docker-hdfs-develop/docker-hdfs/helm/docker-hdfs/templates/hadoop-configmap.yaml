@@ -1,0 +1,1218 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "config-volume-fullname" . }}-hadoop
+  labels:
+    app: {{ include "hadoop.name" . }}
+    chart: {{ include "hadoop.chart" . }}
+    release: {{ .Release.Name }}
+data:
+  getsafemode.sh: |
+    #!/bin/bash
+    while hdfs dfsadmin -safemode get 2>&1 | grep -o "Safe mode is ON" ; do sleep 10 ; done
+  bootstrap.sh: |
+    #!/bin/bash
+
+    TRY_LOOP="5000"
+
+    wait_for_port() {
+      local name="$1" host="$2" port="$3"
+      local j=0
+      while ! nc -zv "$host" "$port" >/dev/null 2>&1 < /dev/null; do
+        j=$((j+1))
+        if [ $j -ge $TRY_LOOP ]; then
+          echo >&2 "$(date) - $host:$port still not reachable, giving up"
+          exit 1
+        fi
+        echo "$(date) - waiting for $name... $j/$TRY_LOOP"
+        sleep 5
+      done
+    }
+
+    : ${HADOOP_HOME:=/usr/local/hadoop}
+
+    . $HADOOP_HOME/etc/hadoop/hadoop-env.sh
+
+    mkdir -p /usr/local/hadoop/logs
+    # sudo chown -R hadoop:hadoop /usr/local/hadoop/logs
+
+    mkdir -p /usr/local/hadoop/audit/solr/spool
+    #chown -R hadoop:hadoop /usr/local/hadoop/audit/solr/spool
+
+    # Directory to find config artifacts
+    CONFIG_DIR="/tmp/hadoop-config"
+
+    # Copy config files from volume mount
+
+    for f in slaves hadoop-env.sh core-site.xml hdfs-site.xml httpfs-site.xml hadoop-env.sh log4j.properties ; do
+      if [[ -e ${CONFIG_DIR}/$f ]]; then
+        cp ${CONFIG_DIR}/$f $HADOOP_HOME/etc/hadoop/$f
+      else
+        echo "ERROR: Could not find $f in $CONFIG_DIR"
+        exit 1
+      fi
+    done
+
+    # installing libraries if any - (resource urls added comma separated to the ACP system variable)
+    cd $HADOOP_HOME/share/hadoop/common ; for cp in ${ACP//,/ }; do  echo == $cp; curl -LO $cp ; done; cd -
+
+    # httpFs
+    if [[ "${HOSTNAME}" =~ "httpfs" ]]; then
+
+      sudo mkdir -p /usr/local/hadoop/hdfs/httpfs
+      sudo chown -R hadoop:hadoop /usr/local/hadoop/hdfs/httpfs
+
+      # make sure both namenodes are up first
+      wait_for_port "{{ include "hadoop.fullname" . }}-namenode-0.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "{{ include "hadoop.fullname" . }}-namenode-0.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "9000"
+      wait_for_port "{{ include "hadoop.fullname" . }}-namenode-1.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "{{ include "hadoop.fullname" . }}-namenode-1.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "9000"
+
+      echo "********************"
+      echo "Starting httpFs"
+      echo "********************"
+      $HADOOP_HOME/bin/hdfs --daemon start httpfs
+    fi
+
+    # journalnode
+    if [[ "${HOSTNAME}" =~ "journalnode" ]]; then
+
+      sudo mkdir -p /usr/local/hadoop/hdfs/journal
+      sudo chown -R hadoop:hadoop /usr/local/hadoop/hdfs/journal
+
+      echo "********************"
+      echo "Starting Journalnode"
+      echo "********************"
+      $HADOOP_HOME/sbin/hadoop-daemon.sh start journalnode
+    fi
+
+    # Namenode
+    if [[ "${HOSTNAME}" =~ "namenode" ]]; then
+      echo "******************"
+      echo "This is a Namenode"
+      echo "******************"
+
+      if [[ $RANGER_ENABLED = "true" ]]; then
+        echo "Enabling Ranger plugin..."
+        cd /usr/local/ranger-hdfs-plugin/
+        sudo -E ./enable-hdfs-plugin.sh
+        sudo -E python $CONFIG_DIR/post_config.py
+      fi
+
+      sudo mkdir -p /usr/local/hadoop/hdfs/namenode
+      sudo chown -R hadoop:hadoop /usr/local/hadoop/hdfs/namenode
+
+      # wait for journal nodes to be up
+      wait_for_port "{{ include "hadoop.fullname" . }}-journalnode-0.{{ include "hadoop.fullname" . }}-journalnode.{{ include "svc-domain" . }}" "{{ include "hadoop.fullname" . }}-journalnode-0.{{ include "hadoop.fullname" . }}-journalnode.{{ include "svc-domain" . }}" "8485"
+      wait_for_port "{{ include "hadoop.fullname" . }}-journalnode-1.{{ include "hadoop.fullname" . }}-journalnode.{{ include "svc-domain" . }}" "{{ include "hadoop.fullname" . }}-journalnode-1.{{ include "hadoop.fullname" . }}-journalnode.{{ include "svc-domain" . }}" "8485"
+      wait_for_port "{{ include "hadoop.fullname" . }}-journalnode-2.{{ include "hadoop.fullname" . }}-journalnode.{{ include "svc-domain" . }}" "{{ include "hadoop.fullname" . }}-journalnode-2.{{ include "hadoop.fullname" . }}-journalnode.{{ include "svc-domain" . }}" "8485"
+
+      sleep 20
+
+      _HDFS_BIN=$HADOOP_HOME/bin/hdfs
+      _METADATA_DIR=/usr/local/hadoop/hdfs/namenode/current
+
+      # Format Active Node
+      if [[ "$MY_POD" = "$NAMENODE_POD_0" ]]; then
+        if [[ ! -d $_METADATA_DIR ]]; then
+            echo "******************"
+            echo "Formating Active"
+            echo "******************"
+            $_HDFS_BIN --config $HADOOP_CONF_DIR namenode -format  \
+                -nonInteractive hdfs-k8s ||
+                (rm -rf $_METADATA_DIR; exit 1)
+        fi
+
+        _ZKFC_FORMATTED=/usr/local/hadoop/hdfs/namenode/current/.hdfs-k8s-zkfc-formatted
+        if [[ ! -f $_ZKFC_FORMATTED ]]; then
+          echo "**********************************"
+          echo "Initialize Node states in Zookeeper"
+          echo "**********************************"
+          _OUT=$($_HDFS_BIN --config $HADOOP_CONF_DIR zkfc -formatZK -nonInteractive 2>&1)
+          # zkfc masks fatal exceptions and returns exit code 0
+          (echo $_OUT | grep -q "FATAL") && exit 1
+          touch $_ZKFC_FORMATTED
+        fi
+
+      elif [[ "$MY_POD" = "$NAMENODE_POD_1" ]]; then
+
+        # Bootstrap Standby Node
+        # make sure active namenode is up first
+        wait_for_port "{{ include "hadoop.fullname" . }}-namenode-0.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "{{ include "hadoop.fullname" . }}-namenode-0.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "9000"
+
+        if [[ ! -d $_METADATA_DIR ]]; then
+            echo "********************"
+            echo "Bootstraping Standby"
+            echo "********************"
+            $_HDFS_BIN --config $HADOOP_CONF_DIR namenode -bootstrapStandby  \
+                -nonInteractive ||  \
+                (rm -rf $_METADATA_DIR; exit 1)
+        fi
+      fi
+
+      # start namenode
+      echo "**************************************"
+      echo "Starting Zookeeper failover controller"
+      echo "**************************************"
+      $HADOOP_HOME/sbin/hadoop-daemon.sh --config $HADOOP_CONF_DIR start zkfc
+      echo "******************"
+      echo "Starting namenode"
+      echo "******************"
+      $_HDFS_BIN --config $HADOOP_CONF_DIR namenode
+    fi
+
+    # datanode
+    if [[ "${HOSTNAME}" =~ "datanode" ]]; then
+      echo "******************"
+      echo "This is a datanode"
+      echo "******************"
+
+      if [[ $RANGER_ENABLED = "true" ]]; then
+        echo "Enabling Ranger plugin..."
+        cd /usr/local/ranger-hdfs-plugin/
+        sudo -E ./enable-hdfs-plugin.sh
+        sudo -E python $CONFIG_DIR/post_config.py
+      fi
+
+      sudo mkdir -p /usr/local/hadoop/hdfs/datanode
+      #sudo chown -R hadoop:hadoop /usr/local/hadoop/hdfs/datanode
+      sudo chown hadoop:hadoop /usr/local/hadoop/hdfs/datanode
+
+      # make sure both namenodes are up first
+      wait_for_port "{{ include "hadoop.fullname" . }}-namenode-0.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "{{ include "hadoop.fullname" . }}-namenode-0.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "9000"
+      wait_for_port "{{ include "hadoop.fullname" . }}-namenode-1.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "{{ include "hadoop.fullname" . }}-namenode-1.{{ include "hadoop.fullname" . }}-namenode.{{ include "svc-domain" . }}" "9000"
+
+      $HADOOP_HOME/sbin/hadoop-daemon.sh start datanode
+    fi
+
+    if [[ $1 == "-d" ]]; then
+      until find ${HADOOP_HOME}/logs -mmin -1 | egrep -q '.*'; echo "`date`: Waiting for logs..." ; do sleep 2 ; done
+      tail -F ${HADOOP_HOME}/logs/* &
+      while true; do sleep 1000; done
+    fi
+
+    if [[ $1 == "-bash" ]]; then
+      /bin/bash
+    fi
+
+  post_config.py: |
+    import os
+    from xml.etree import ElementTree as etree
+
+    xml_config_file = "/usr/local/hadoop/etc/hadoop/ranger-hdfs-security.xml"
+
+    tree = etree.parse(xml_config_file)
+    root = tree.getroot()
+    for prop in root.iter('property'):
+        if prop[0].text == 'xasecure.add-hadoop-authorization':
+            prop[1].text = '{{ .Values.enableHadoopAcls }}'
+
+    tree.write(xml_config_file)
+
+  core-site.xml: |
+    <?xml version="1.0"?>
+    <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+    <configuration>
+      <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://hdfs-k8s</value>
+      </property>
+      <property>
+        <name>ha.zookeeper.quorum</name>
+        <value>{{ .Values.highAvailability.Zookeeper.Host }}:{{ .Values.highAvailability.Zookeeper.Port }}</value>
+      </property>
+      <property>
+            <name>hadoop.security.authentication</name>
+            <value>simple</value>
+            <description>Possible values are simple (no authentication), and kerberos</description>
+        </property>
+
+      <property>
+         <name>hadoop.proxyuser.trifacta.hosts</name>
+         <value>*</value>
+      </property>
+      <property>
+         <name>hadoop.proxyuser.trifacta.users</name>
+         <value>*</value>
+      </property>
+
+      <property>
+         <name>hadoop.proxyuser.hadoop.hosts</name>
+         <value>*</value>
+      </property>
+      <property>
+         <name>hadoop.proxyuser.hadoop.groups</name>
+         <value>*</value>
+      </property>
+
+      <property>
+        <name>ipc.maximum.data.length</name>
+        <value>134217728</value>
+      </property>
+
+    </configuration>
+
+  hdfs-site.xml: |
+    <?xml version="1.0"?>
+    <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+    <configuration>
+
+      <property>
+        <name>dfs.nameservices</name>
+        <value>hdfs-k8s</value>
+      </property>
+
+      <property>
+        <name>dfs.ha.namenodes.hdfs-k8s</name>
+        <value>nn1,nn2</value>
+      </property>
+
+      <property>
+        <name>dfs.namenode.rpc-address.hdfs-k8s.nn1</name>
+        <value>{{ template "namenode-svc-1" . }}:9000</value>
+      </property>
+
+      <property>
+        <name>dfs.namenode.rpc-address.hdfs-k8s.nn2</name>
+        <value>{{ template "namenode-svc-2" . }}:9000</value>
+      </property>
+
+      <property>
+        <name>dfs.namenode.http-address.hdfs-k8s.nn1</name>
+        <value>{{ template "namenode-svc-1" . }}:9870</value>
+      </property>
+
+      <property>
+        <name>dfs.namenode.http-address.hdfs-k8s.nn2</name>
+        <value>{{ template "namenode-svc-2" . }}:9870</value>
+      </property>
+
+      <property>
+        <name>dfs.namenode.shared.edits.dir</name>
+        <value>qjournal://{{ template "journalnode-quorum" . }}/hdfs-k8s</value>
+      </property>
+
+      <property>
+        <name>dfs.ha.automatic-failover.enabled</name>
+        <value>true</value>
+      </property>
+
+      <property>
+        <name>dfs.ha.fencing.methods</name>
+        <value>shell(/bin/true)</value>
+      </property>
+
+      <property>
+        <name>dfs.journalnode.edits.dir</name>
+        <value>/usr/local/hadoop/hdfs/journal</value>
+      </property>
+
+      <property>
+        <name>dfs.client.failover.proxy.provider.hdfs-k8s</name>
+        <value>org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider</value>
+      </property>
+
+      <property>
+          <name>dfs.webhdfs.enabled</name>
+          <value>true</value>
+      </property>
+
+      <property>
+        <name>dfs.datanode.use.datanode.hostname</name>
+        <value>true</value>
+      </property>
+
+      <property>
+        <name>dfs.client.use.datanode.hostname</name>
+        <value>true</value>
+      </property>
+
+      <property>
+        <name>dfs.replication</name>
+          <value>3</value>
+      </property>
+
+      <property>
+        <name>dfs.datanode.data.dir</name>
+        <value>file:///usr/local/hadoop/hdfs/datanode</value>
+        <description>DataNode directory</description>
+      </property>
+
+      <property>
+        <name>dfs.namenode.name.dir</name>
+        <value>file:///usr/local/hadoop/hdfs/namenode</value>
+        <description>NameNode directory for namespace and transaction logs storage.</description>
+      </property>
+
+      <property>
+        <name>dfs.namenode.datanode.registration.ip-hostname-check</name>
+        <value>true</value>
+      </property>
+
+      <property>
+        <name>dfs.permissions</name>
+        <value>{{ .Values.enableDfsPermissions }}</value>
+      </property>
+
+      <property>
+        <name>dfs.namenode.acls.enabled</name>
+        <value>false</value>
+        <description>Set to true to enable support for HDFS ACLs (Access Control Lists). By default, ACLs are disabled. When ACLs are disabled, the NameNode rejects all attempts to set an ACL.</description>
+      </property>
+
+      <property>
+        <name>dfs.datanode.failed.volumes.tolerated</name>
+        <value>0</value>
+      </property>
+
+    </configuration>
+
+  httpfs-site.xml: |
+    <?xml version="1.0" encoding="UTF-8"?>
+    <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+    <!--
+      Licensed under the Apache License, Version 2.0 (the "License");
+      you may not use this file except in compliance with the License.
+      You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+      Unless required by applicable law or agreed to in writing, software
+      distributed under the License is distributed on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+      See the License for the specific language governing permissions and
+      limitations under the License. See accompanying LICENSE file.
+    -->
+
+    <!-- Put site-specific property overrides in this file. -->
+
+    <configuration>
+      <property>
+        <name>httpfs.hadoop.config.dir</name>
+        <value>/usr/local/hadoop/etc/hadoop</value>
+      </property>
+      <property>
+        <name>httpfs.proxyuser.trifacta.groups</name>
+        <value>*</value>
+      </property>
+      <property>
+        <name>httpfs.proxyuser.trifacta.hosts</name>
+        <value>*</value>
+      </property>
+    </configuration>
+
+  httpfs-env.xml: |
+    #!/usr/bin/env bash
+    #
+    # Licensed under the Apache License, Version 2.0 (the "License");
+    # you may not use this file except in compliance with the License.
+    # You may obtain a copy of the License at
+    #
+    #   http://www.apache.org/licenses/LICENSE-2.0
+    #
+    #  Unless required by applicable law or agreed to in writing, software
+    #  distributed under the License is distributed on an "AS IS" BASIS,
+    #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    #  See the License for the specific language governing permissions and
+    #  limitations under the License. See accompanying LICENSE file.
+    #
+
+    # Set httpfs specific environment variables here.
+    #
+    # hadoop-env.sh is read prior to this file.
+    #
+
+    # HTTPFS config directory
+    #
+    # export HTTPFS_CONFIG=${HADOOP_CONF_DIR}
+
+    # HTTPFS log directory
+    #
+    # export HTTPFS_LOG=${HADOOP_LOG_DIR}
+
+    # HTTPFS temporary directory
+    #
+    # export HTTPFS_TEMP=${HADOOP_HDFS_HOME}/temp
+
+    # The HTTP port used by HTTPFS
+    #
+    # export HTTPFS_HTTP_PORT=14000
+
+    # The maximum number of HTTP handler threads
+    #
+    # export HTTPFS_MAX_THREADS=1000
+
+    # The hostname HttpFS server runs on
+    #
+    # export HTTPFS_HTTP_HOSTNAME=$(hostname -f)
+
+    # The maximum size of HTTP header
+    #
+    # export HTTPFS_MAX_HTTP_HEADER_SIZE=65536
+
+    # Whether SSL is enabled
+    #
+    # export HTTPFS_SSL_ENABLED=false
+
+    # The location of the SSL keystore if using SSL
+    #
+    # export HTTPFS_SSL_KEYSTORE_FILE=${HOME}/.keystore
+
+    # The password of the SSL keystore if using SSL
+    #
+    # export HTTPFS_SSL_KEYSTORE_PASS=password
+  slaves: |
+    localhost
+
+  hadoop-env.sh: |
+    #
+    # Licensed to the Apache Software Foundation (ASF) under one
+    # or more contributor license agreements.  See the NOTICE file
+    # distributed with this work for additional information
+    # regarding copyright ownership.  The ASF licenses this file
+    # to you under the Apache License, Version 2.0 (the
+    # "License"); you may not use this file except in compliance
+    # with the License.  You may obtain a copy of the License at
+    #
+    #     http://www.apache.org/licenses/LICENSE-2.0
+    #
+    # Unless required by applicable law or agreed to in writing, software
+    # distributed under the License is distributed on an "AS IS" BASIS,
+    # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    # See the License for the specific language governing permissions and
+    # limitations under the License.
+
+    # Set Hadoop-specific environment variables here.
+
+    ##
+    ## THIS FILE ACTS AS THE MASTER FILE FOR ALL HADOOP PROJECTS.
+    ## SETTINGS HERE WILL BE READ BY ALL HADOOP COMMANDS.  THEREFORE,
+    ## ONE CAN USE THIS FILE TO SET YARN, HDFS, AND MAPREDUCE
+    ## CONFIGURATION OPTIONS INSTEAD OF xxx-env.sh.
+    ##
+    ## Precedence rules:
+    ##
+    ## {yarn-env.sh|hdfs-env.sh} > hadoop-env.sh > hard-coded defaults
+    ##
+    ## {YARN_xyz|HDFS_xyz} > HADOOP_xyz > hard-coded defaults
+    ##
+
+    # Many of the options here are built from the perspective that users
+    # may want to provide OVERWRITING values on the command line.
+    # For example:
+    #
+    #  JAVA_HOME=/usr/java/testing hdfs dfs -ls
+    #
+    # Therefore, the vast majority (BUT NOT ALL!) of these defaults
+    # are configured for substitution and not append.  If append
+    # is preferable, modify this file accordingly.
+
+    ###
+    # Generic settings for HADOOP
+    ###
+
+    # Technically, the only required environment variable is JAVA_HOME.
+    # All others are optional.  However, the defaults are probably not
+    # preferred.  Many sites configure these options outside of Hadoop,
+    # such as in /etc/profile.d
+
+    # The java implementation to use. By default, this environment
+    # variable is REQUIRED on ALL platforms except OS X!
+    # export JAVA_HOME=
+
+    # Location of Hadoop.  By default, Hadoop will attempt to determine
+    # this location based upon its execution path.
+    # export HADOOP_HOME=
+
+    # Location of Hadoop's configuration information.  i.e., where this
+    # file is living. If this is not defined, Hadoop will attempt to
+    # locate it based upon its execution path.
+    #
+    # NOTE: It is recommend that this variable not be set here but in
+    # /etc/profile.d or equivalent.  Some options (such as
+    # --config) may react strangely otherwise.
+    #
+    # export HADOOP_CONF_DIR=${HADOOP_HOME}/etc/hadoop
+
+    # The maximum amount of heap to use (Java -Xmx).  If no unit
+    # is provided, it will be converted to MB.  Daemons will
+    # prefer any Xmx setting in their respective _OPT variable.
+    # There is no default; the JVM will autoscale based upon machine
+    # memory size.
+    # export HADOOP_HEAPSIZE_MAX=
+
+    # The minimum amount of heap to use (Java -Xms).  If no unit
+    # is provided, it will be converted to MB.  Daemons will
+    # prefer any Xms setting in their respective _OPT variable.
+    # There is no default; the JVM will autoscale based upon machine
+    # memory size.
+    # export HADOOP_HEAPSIZE_MIN=
+
+    # Enable extra debugging of Hadoop's JAAS binding, used to set up
+    # Kerberos security.
+    # export HADOOP_JAAS_DEBUG=true
+
+    # Extra Java runtime options for all Hadoop commands. We don't support
+    # IPv6 yet/still, so by default the preference is set to IPv4.
+    # export HADOOP_OPTS="-Djava.net.preferIPv4Stack=true"
+    # For Kerberos debugging, an extended option set logs more information
+    # export HADOOP_OPTS="-Djava.net.preferIPv4Stack=true -Dsun.security.krb5.debug=true -Dsun.security.spnego.debug"
+
+    # Some parts of the shell code may do special things dependent upon
+    # the operating system.  We have to set this here. See the next
+    # section as to why....
+    export HADOOP_OS_TYPE=${HADOOP_OS_TYPE:-$(uname -s)}
+
+
+    # Under certain conditions, Java on OS X will throw SCDynamicStore errors
+    # in the system logs.
+    # See HADOOP-8719 for more information.  If one needs Kerberos
+    # support on OS X, one will want to change/remove this extra bit.
+    case ${HADOOP_OS_TYPE} in
+      Darwin*)
+        export HADOOP_OPTS="${HADOOP_OPTS} -Djava.security.krb5.realm= "
+        export HADOOP_OPTS="${HADOOP_OPTS} -Djava.security.krb5.kdc= "
+        export HADOOP_OPTS="${HADOOP_OPTS} -Djava.security.krb5.conf= "
+      ;;
+    esac
+
+    # Extra Java runtime options for some Hadoop commands
+    # and clients (i.e., hdfs dfs -blah).  These get appended to HADOOP_OPTS for
+    # such commands.  In most cases, # this should be left empty and
+    # let users supply it on the command line.
+    # export HADOOP_CLIENT_OPTS=""
+
+    #
+    # A note about classpaths.
+    #
+    # By default, Apache Hadoop overrides Java's CLASSPATH
+    # environment variable.  It is configured such
+    # that it starts out blank with new entries added after passing
+    # a series of checks (file/dir exists, not already listed aka
+    # de-deduplication).  During de-deduplication, wildcards and/or
+    # directories are *NOT* expanded to keep it simple. Therefore,
+    # if the computed classpath has two specific mentions of
+    # awesome-methods-1.0.jar, only the first one added will be seen.
+    # If two directories are in the classpath that both contain
+    # awesome-methods-1.0.jar, then Java will pick up both versions.
+
+    # An additional, custom CLASSPATH. Site-wide configs should be
+    # handled via the shellprofile functionality, utilizing the
+    # hadoop_add_classpath function for greater control and much
+    # harder for apps/end-users to accidentally override.
+    # Similarly, end users should utilize ${HOME}/.hadooprc .
+    # This variable should ideally only be used as a short-cut,
+    # interactive way for temporary additions on the command line.
+    # export HADOOP_CLASSPATH="/some/cool/path/on/your/machine"
+
+    # Should HADOOP_CLASSPATH be first in the official CLASSPATH?
+    # export HADOOP_USER_CLASSPATH_FIRST="yes"
+
+    # If HADOOP_USE_CLIENT_CLASSLOADER is set, the classpath along
+    # with the main jar are handled by a separate isolated
+    # client classloader when 'hadoop jar', 'yarn jar', or 'mapred job'
+    # is utilized. If it is set, HADOOP_CLASSPATH and
+    # HADOOP_USER_CLASSPATH_FIRST are ignored.
+    # export HADOOP_USE_CLIENT_CLASSLOADER=true
+
+    # HADOOP_CLIENT_CLASSLOADER_SYSTEM_CLASSES overrides the default definition of
+    # system classes for the client classloader when HADOOP_USE_CLIENT_CLASSLOADER
+    # is enabled. Names ending in '.' (period) are treated as package names, and
+    # names starting with a '-' are treated as negative matches. For example,
+    # export HADOOP_CLIENT_CLASSLOADER_SYSTEM_CLASSES="-org.apache.hadoop.UserClass,java.,javax.,org.apache.hadoop."
+
+    # Enable optional, bundled Hadoop features
+    # This is a comma delimited list.  It may NOT be overridden via .hadooprc
+    # Entries may be added/removed as needed.
+    # export HADOOP_OPTIONAL_TOOLS="hadoop-aliyun,hadoop-aws,hadoop-azure-datalake,hadoop-azure,hadoop-kafka,hadoop-openstack"
+
+    ###
+    # Options for remote shell connectivity
+    ###
+
+    # There are some optional components of hadoop that allow for
+    # command and control of remote hosts.  For example,
+    # start-dfs.sh will attempt to bring up all NNs, DNS, etc.
+
+    # Options to pass to SSH when one of the "log into a host and
+    # start/stop daemons" scripts is executed
+    # export HADOOP_SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10s"
+
+    # The built-in ssh handler will limit itself to 10 simultaneous connections.
+    # For pdsh users, this sets the fanout size ( -f )
+    # Change this to increase/decrease as necessary.
+    # export HADOOP_SSH_PARALLEL=10
+
+    # Filename which contains all of the hosts for any remote execution
+    # helper scripts # such as workers.sh, start-dfs.sh, etc.
+    # export HADOOP_WORKERS="${HADOOP_CONF_DIR}/workers"
+
+    ###
+    # Options for all daemons
+    ###
+    #
+
+    #
+    # Many options may also be specified as Java properties.  It is
+    # very common, and in many cases, desirable, to hard-set these
+    # in daemon _OPTS variables.  Where applicable, the appropriate
+    # Java property is also identified.  Note that many are re-used
+    # or set differently in certain contexts (e.g., secure vs
+    # non-secure)
+    #
+
+    # Where (primarily) daemon log files are stored.
+    # ${HADOOP_HOME}/logs by default.
+    # Java property: hadoop.log.dir
+    # export HADOOP_LOG_DIR=${HADOOP_HOME}/logs
+
+    # A string representing this instance of hadoop. $USER by default.
+    # This is used in writing log and pid files, so keep that in mind!
+    # Java property: hadoop.id.str
+    # export HADOOP_IDENT_STRING=$USER
+
+    # How many seconds to pause after stopping a daemon
+    # export HADOOP_STOP_TIMEOUT=5
+
+    # Where pid files are stored.  /tmp by default.
+    # export HADOOP_PID_DIR=/tmp
+
+    # Default log4j setting for interactive commands
+    # Java property: hadoop.root.logger
+    export HADOOP_ROOT_LOGGER={{ .Values.LogLevel }},console
+
+    # Default log4j setting for daemons spawned explicitly by
+    # --daemon option of hadoop, hdfs, mapred and yarn command.
+    # Java property: hadoop.root.logger
+    export HADOOP_DAEMON_ROOT_LOGGER={{ .Values.LogLevel }},RFA
+
+    # Default log level and output location for security-related messages.
+    # You will almost certainly want to change this on a per-daemon basis via
+    # the Java property (i.e., -Dhadoop.security.logger=foo). (Note that the
+    # defaults for the NN and 2NN override this by default.)
+    # Java property: hadoop.security.logger
+    # export HADOOP_SECURITY_LOGGER=INFO,NullAppender
+
+    # Default process priority level
+    # Note that sub-processes will also run at this level!
+    # export HADOOP_NICENESS=0
+
+    # Default name for the service level authorization file
+    # Java property: hadoop.policy.file
+    # export HADOOP_POLICYFILE="hadoop-policy.xml"
+
+    #
+    # NOTE: this is not used by default!  <-----
+    # You can define variables right here and then re-use them later on.
+    # For example, it is common to use the same garbage collection settings
+    # for all the daemons.  So one could define:
+    #
+    # export HADOOP_GC_SETTINGS="-verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps -XX:+PrintGCDateStamps"
+    #
+    # .. and then use it as per the b option under the namenode.
+
+    ###
+    # Secure/privileged execution
+    ###
+
+    #
+    # Out of the box, Hadoop uses jsvc from Apache Commons to launch daemons
+    # on privileged ports.  This functionality can be replaced by providing
+    # custom functions.  See hadoop-functions.sh for more information.
+    #
+
+    # The jsvc implementation to use. Jsvc is required to run secure datanodes
+    # that bind to privileged ports to provide authentication of data transfer
+    # protocol.  Jsvc is not required if SASL is configured for authentication of
+    # data transfer protocol using non-privileged ports.
+    # export JSVC_HOME=/usr/bin
+
+    #
+    # This directory contains pids for secure and privileged processes.
+    #export HADOOP_SECURE_PID_DIR=${HADOOP_PID_DIR}
+
+    #
+    # This directory contains the logs for secure and privileged processes.
+    # Java property: hadoop.log.dir
+    # export HADOOP_SECURE_LOG=${HADOOP_LOG_DIR}
+
+    #
+    # When running a secure daemon, the default value of HADOOP_IDENT_STRING
+    # ends up being a bit bogus.  Therefore, by default, the code will
+    # replace HADOOP_IDENT_STRING with HADOOP_xx_SECURE_USER.  If one wants
+    # to keep HADOOP_IDENT_STRING untouched, then uncomment this line.
+    # export HADOOP_SECURE_IDENT_PRESERVE="true"
+
+    ###
+    # NameNode specific parameters
+    ###
+
+    # Default log level and output location for file system related change
+    # messages. For non-namenode daemons, the Java property must be set in
+    # the appropriate _OPTS if one wants something other than INFO,NullAppender
+    # Java property: hdfs.audit.logger
+    # export HDFS_AUDIT_LOGGER=INFO,NullAppender
+
+    # Specify the JVM options to be used when starting the NameNode.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # a) Set JMX options
+    if [ X$NAMENODE_JMX_DISABLE = X"false" ]
+      then
+        export HDFS_NAMENODE_OPTS="-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.port=1026 -Dcom.sun.management.jmxremote.rmi.port=1026 -Djava.rmi.server.hostname=127.0.0.1"
+    fi
+    if [ X$DATANODE_JMX_DISABLE = X"false" ]
+      then
+        export HDFS_DATANODE_OPTS="-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.port=1027 -Dcom.sun.management.jmxremote.rmi.port=1027 -Djava.rmi.server.hostname=127.0.0.1"
+    fi
+    if [ X$JOURNALNODE_JMX_DISABLE = X"false" ]
+      then
+        export HDFS_JOURNALNODE_OPTS="-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.port=1028 -Dcom.sun.management.jmxremote.rmi.port=1028 -Djava.rmi.server.hostname=127.0.0.1"
+    fi
+    #
+    # b) Set garbage collection logs
+    # export HDFS_NAMENODE_OPTS="${HADOOP_GC_SETTINGS} -Xloggc:${HADOOP_LOG_DIR}/gc-rm.log-$(date +'%Y%m%d%H%M')"
+    #
+    # c) ... or set them directly
+    # export HDFS_NAMENODE_OPTS="-verbose:gc -XX:+PrintGCDetails -XX:+PrintGCTimeStamps -XX:+PrintGCDateStamps -Xloggc:${HADOOP_LOG_DIR}/gc-rm.log-$(date +'%Y%m%d%H%M')"
+
+    # this is the default:
+    # export HDFS_NAMENODE_OPTS="-Dhadoop.security.logger=INFO,RFAS"
+
+    ###
+    # SecondaryNameNode specific parameters
+    ###
+    # Specify the JVM options to be used when starting the SecondaryNameNode.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # This is the default:
+    # export HDFS_SECONDARYNAMENODE_OPTS="-Dhadoop.security.logger=INFO,RFAS"
+
+    ###
+    # DataNode specific parameters
+    ###
+    # Specify the JVM options to be used when starting the DataNode.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # This is the default:
+    # export HDFS_DATANODE_OPTS="-Dhadoop.security.logger=ERROR,RFAS"
+
+    # On secure datanodes, user to run the datanode as after dropping privileges.
+    # This **MUST** be uncommented to enable secure HDFS if using privileged ports
+    # to provide authentication of data transfer protocol.  This **MUST NOT** be
+    # defined if SASL is configured for authentication of data transfer protocol
+    # using non-privileged ports.
+    # This will replace the hadoop.id.str Java property in secure mode.
+    # export HDFS_DATANODE_SECURE_USER=hdfs
+
+    # Supplemental options for secure datanodes
+    # By default, Hadoop uses jsvc which needs to know to launch a
+    # server jvm.
+    # export HDFS_DATANODE_SECURE_EXTRA_OPTS="-jvm server"
+
+    ###
+    # NFS3 Gateway specific parameters
+    ###
+    # Specify the JVM options to be used when starting the NFS3 Gateway.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # export HDFS_NFS3_OPTS=""
+
+    # Specify the JVM options to be used when starting the Hadoop portmapper.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # export HDFS_PORTMAP_OPTS="-Xmx512m"
+
+    # Supplemental options for priviliged gateways
+    # By default, Hadoop uses jsvc which needs to know to launch a
+    # server jvm.
+    # export HDFS_NFS3_SECURE_EXTRA_OPTS="-jvm server"
+
+    # On privileged gateways, user to run the gateway as after dropping privileges
+    # This will replace the hadoop.id.str Java property in secure mode.
+    # export HDFS_NFS3_SECURE_USER=nfsserver
+
+    ###
+    # ZKFailoverController specific parameters
+    ###
+    # Specify the JVM options to be used when starting the ZKFailoverController.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # export HDFS_ZKFC_OPTS=""
+
+    ###
+    # QuorumJournalNode specific parameters
+    ###
+    # Specify the JVM options to be used when starting the QuorumJournalNode.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # export HDFS_JOURNALNODE_OPTS=""
+
+    ###
+    # HDFS Balancer specific parameters
+    ###
+    # Specify the JVM options to be used when starting the HDFS Balancer.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # export HDFS_BALANCER_OPTS=""
+
+    ###
+    # HDFS Mover specific parameters
+    ###
+    # Specify the JVM options to be used when starting the HDFS Mover.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # export HDFS_MOVER_OPTS=""
+
+    ###
+    # Router-based HDFS Federation specific parameters
+    # Specify the JVM options to be used when starting the RBF Routers.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # export HDFS_DFSROUTER_OPTS=""
+
+    ###
+    # HDFS StorageContainerManager specific parameters
+    ###
+    # Specify the JVM options to be used when starting the HDFS Storage Container Manager.
+    # These options will be appended to the options specified as HADOOP_OPTS
+    # and therefore may override any similar flags set in HADOOP_OPTS
+    #
+    # export HDFS_STORAGECONTAINERMANAGER_OPTS=""
+
+    ###
+    # Advanced Users Only!
+    ###
+
+    #
+    # When building Hadoop, one can add the class paths to the commands
+    # via this special env var:
+    # export HADOOP_ENABLE_BUILD_PATHS="true"
+
+    #
+    # To prevent accidents, shell commands be (superficially) locked
+    # to only allow certain users to execute certain subcommands.
+    # It uses the format of (command)_(subcommand)_USER.
+    #
+    # For example, to limit who can execute the namenode command,
+    # export HDFS_NAMENODE_USER=hdfs
+  log4j.properties: |
+    # Licensed to the Apache Software Foundation (ASF) under one
+    # or more contributor license agreements.  See the NOTICE file
+    # distributed with this work for additional information
+    # regarding copyright ownership.  The ASF licenses this file
+    # to you under the Apache License, Version 2.0 (the
+    # "License"); you may not use this file except in compliance
+    # with the License.  You may obtain a copy of the License at
+    #
+    #     http://www.apache.org/licenses/LICENSE-2.0
+    #
+    # Unless required by applicable law or agreed to in writing, software
+    # distributed under the License is distributed on an "AS IS" BASIS,
+    # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    # See the License for the specific language governing permissions and
+    # limitations under the License.
+
+    # Define some default values that can be overridden by system properties
+    hadoop.root.logger=INFO,console
+    hadoop.log.dir=.
+    hadoop.log.file=hadoop.log
+
+    # Define the root logger to the system property "hadoop.root.logger".
+    log4j.rootLogger=${hadoop.root.logger}, EventCounter
+
+    # Logging Threshold
+    log4j.threshold=ALL
+
+    # Null Appender
+    log4j.appender.NullAppender=org.apache.log4j.varia.NullAppender
+
+    #
+    # Rolling File Appender - cap space usage at 5gb.
+    #
+    hadoop.log.maxfilesize=256MB
+    hadoop.log.maxbackupindex=20
+    log4j.appender.RFA=org.apache.log4j.RollingFileAppender
+    log4j.appender.RFA.File=${hadoop.log.dir}/${hadoop.log.file}
+
+    log4j.appender.RFA.MaxFileSize=${hadoop.log.maxfilesize}
+    log4j.appender.RFA.MaxBackupIndex=${hadoop.log.maxbackupindex}
+
+    log4j.appender.RFA.layout=org.apache.log4j.PatternLayout
+
+    # Pattern format: Date LogLevel LoggerName LogMessage
+    log4j.appender.RFA.layout.ConversionPattern=%d{ISO8601} %p %c: %m%n
+    # Debugging Pattern format
+    #log4j.appender.RFA.layout.ConversionPattern=%d{ISO8601} %-5p %c{2} (%F:%M(%L)) - %m%n
+
+
+    #
+    # Daily Rolling File Appender
+    #
+
+    log4j.appender.DRFA=org.apache.log4j.DailyRollingFileAppender
+    log4j.appender.DRFA.File=${hadoop.log.dir}/${hadoop.log.file}
+
+    # Rollover at midnight
+    log4j.appender.DRFA.DatePattern=.yyyy-MM-dd
+
+    log4j.appender.DRFA.layout=org.apache.log4j.PatternLayout
+
+    # Pattern format: Date LogLevel LoggerName LogMessage
+    log4j.appender.DRFA.layout.ConversionPattern=%d{ISO8601} %p %c: %m%n
+    # Debugging Pattern format
+    #log4j.appender.DRFA.layout.ConversionPattern=%d{ISO8601} %-5p %c{2} (%F:%M(%L)) - %m%n
+
+
+    #
+    # console
+    # Add "console" to rootlogger above if you want to use this
+    #
+
+    log4j.appender.console=org.apache.log4j.ConsoleAppender
+    log4j.appender.console.target=System.err
+    log4j.appender.console.layout=org.apache.log4j.PatternLayout
+    log4j.appender.console.layout.ConversionPattern=%d{ISO8601} %p %c{2}: %m%n
+
+    #
+    # TaskLog Appender
+    #
+    log4j.appender.TLA=org.apache.hadoop.mapred.TaskLogAppender
+
+    log4j.appender.TLA.layout=org.apache.log4j.PatternLayout
+    log4j.appender.TLA.layout.ConversionPattern=%d{ISO8601} %p %c: %m%n
+
+    #
+    # HDFS block state change log from block manager
+    #
+    # Uncomment the following to log normal block state change
+    # messages from BlockManager in NameNode.
+    #log4j.logger.BlockStateChange=DEBUG
+
+    #
+    #Security appender
+    #
+    hadoop.security.logger=INFO,NullAppender
+    hadoop.security.log.maxfilesize=256MB
+    hadoop.security.log.maxbackupindex=20
+    log4j.category.SecurityLogger=${hadoop.security.logger}
+    hadoop.security.log.file=SecurityAuth-${user.name}.audit
+    log4j.appender.RFAS=org.apache.log4j.RollingFileAppender
+    log4j.appender.RFAS.File=${hadoop.log.dir}/${hadoop.security.log.file}
+    log4j.appender.RFAS.layout=org.apache.log4j.PatternLayout
+    log4j.appender.RFAS.layout.ConversionPattern=%d{ISO8601} %p %c: %m%n
+    log4j.appender.RFAS.MaxFileSize=${hadoop.security.log.maxfilesize}
+    log4j.appender.RFAS.MaxBackupIndex=${hadoop.security.log.maxbackupindex}
+
+    #
+    # Daily Rolling Security appender
+    #
+    log4j.appender.DRFAS=org.apache.log4j.DailyRollingFileAppender
+    log4j.appender.DRFAS.File=${hadoop.log.dir}/${hadoop.security.log.file}
+    log4j.appender.DRFAS.layout=org.apache.log4j.PatternLayout
+    log4j.appender.DRFAS.layout.ConversionPattern=%d{ISO8601} %p %c: %m%n
+    log4j.appender.DRFAS.DatePattern=.yyyy-MM-dd
+
+    #
+    # hadoop configuration logging
+    #
+
+    # Uncomment the following line to turn off configuration deprecation warnings.
+    # log4j.logger.org.apache.hadoop.conf.Configuration.deprecation=WARN
+
+    #
+    # hdfs audit logging
+    #
+    hdfs.audit.logger=INFO,NullAppender
+    hdfs.audit.log.maxfilesize=256MB
+    hdfs.audit.log.maxbackupindex=20
+    log4j.logger.org.apache.hadoop.hdfs.server.namenode.FSNamesystem.audit=${hdfs.audit.logger}
+    log4j.additivity.org.apache.hadoop.hdfs.server.namenode.FSNamesystem.audit=false
+    log4j.appender.RFAAUDIT=org.apache.log4j.RollingFileAppender
+    log4j.appender.RFAAUDIT.File=${hadoop.log.dir}/hdfs-audit.log
+    log4j.appender.RFAAUDIT.layout=org.apache.log4j.PatternLayout
+    log4j.appender.RFAAUDIT.layout.ConversionPattern=%d{ISO8601} %p %c{2}: %m%n
+    log4j.appender.RFAAUDIT.MaxFileSize=${hdfs.audit.log.maxfilesize}
+    log4j.appender.RFAAUDIT.MaxBackupIndex=${hdfs.audit.log.maxbackupindex}
+
+    #
+    # NameNode metrics logging.
+    # The default is to retain two namenode-metrics.log files up to 64MB each.
+    #
+    namenode.metrics.logger=INFO,NullAppender
+    log4j.logger.NameNodeMetricsLog=${namenode.metrics.logger}
+    log4j.additivity.NameNodeMetricsLog=false
+    log4j.appender.NNMETRICSRFA=org.apache.log4j.RollingFileAppender
+    log4j.appender.NNMETRICSRFA.File=${hadoop.log.dir}/namenode-metrics.log
+    log4j.appender.NNMETRICSRFA.layout=org.apache.log4j.PatternLayout
+    log4j.appender.NNMETRICSRFA.layout.ConversionPattern=%d{ISO8601} %m%n
+    log4j.appender.NNMETRICSRFA.MaxBackupIndex=1
+    log4j.appender.NNMETRICSRFA.MaxFileSize=64MB
+
+    #
+    # DataNode metrics logging.
+    # The default is to retain two datanode-metrics.log files up to 64MB each.
+    #
+    datanode.metrics.logger=INFO,NullAppender
+    log4j.logger.DataNodeMetricsLog=${datanode.metrics.logger}
+    log4j.additivity.DataNodeMetricsLog=false
+    log4j.appender.DNMETRICSRFA=org.apache.log4j.RollingFileAppender
+    log4j.appender.DNMETRICSRFA.File=${hadoop.log.dir}/datanode-metrics.log
+    log4j.appender.DNMETRICSRFA.layout=org.apache.log4j.PatternLayout
+    log4j.appender.DNMETRICSRFA.layout.ConversionPattern=%d{ISO8601} %m%n
+    log4j.appender.DNMETRICSRFA.MaxBackupIndex=1
+    log4j.appender.DNMETRICSRFA.MaxFileSize=64MB
+
+    # Custom Logging levels
+
+    #log4j.logger.org.apache.hadoop.mapred.JobTracker=DEBUG
+    #log4j.logger.org.apache.hadoop.mapred.TaskTracker=DEBUG
+    #log4j.logger.org.apache.hadoop.hdfs.server.namenode.FSNamesystem.audit=DEBUG
+
+
+    # AWS SDK & S3A FileSystem
+    #log4j.logger.com.amazonaws=ERROR
+    log4j.logger.com.amazonaws.http.AmazonHttpClient=ERROR
+    #log4j.logger.org.apache.hadoop.fs.s3a.S3AFileSystem=WARN
+
+    #
+    # Event Counter Appender
+    # Sends counts of logging messages at different severity levels to Hadoop Metrics.
+    #
+    log4j.appender.EventCounter=org.apache.hadoop.log.metrics.EventCounter
+
+    #
+    # Job Summary Appender
+    #
+    # Use following logger to send summary to separate file defined by
+    # hadoop.mapreduce.jobsummary.log.file :
+    # hadoop.mapreduce.jobsummary.logger=INFO,JSA
+    #
+    hadoop.mapreduce.jobsummary.logger=${hadoop.root.logger}
+    hadoop.mapreduce.jobsummary.log.file=hadoop-mapreduce.jobsummary.log
+    hadoop.mapreduce.jobsummary.log.maxfilesize=256MB
+    hadoop.mapreduce.jobsummary.log.maxbackupindex=20
+    log4j.appender.JSA=org.apache.log4j.RollingFileAppender
+    log4j.appender.JSA.File=${hadoop.log.dir}/${hadoop.mapreduce.jobsummary.log.file}
+    log4j.appender.JSA.MaxFileSize=${hadoop.mapreduce.jobsummary.log.maxfilesize}
+    log4j.appender.JSA.MaxBackupIndex=${hadoop.mapreduce.jobsummary.log.maxbackupindex}
+    log4j.appender.JSA.layout=org.apache.log4j.PatternLayout
+    log4j.appender.JSA.layout.ConversionPattern=%d{ISO8601} %p %c{2}: %m%n
+    log4j.logger.org.apache.hadoop.mapred.JobInProgress$JobSummary=${hadoop.mapreduce.jobsummary.logger}
+    log4j.additivity.org.apache.hadoop.mapred.JobInProgress$JobSummary=false
+
+    #
+    # shuffle connection log from shuffleHandler
+    # Uncomment the following line to enable logging of shuffle connections
+    # log4j.logger.org.apache.hadoop.mapred.ShuffleHandler.audit=DEBUG
+
+    #
+    # Yarn ResourceManager Application Summary Log
+    #
+    # Set the ResourceManager summary log filename
+    yarn.server.resourcemanager.appsummary.log.file=rm-appsummary.log
+    # Set the ResourceManager summary log level and appender
+    yarn.server.resourcemanager.appsummary.logger=${hadoop.root.logger}
+    #yarn.server.resourcemanager.appsummary.logger=INFO,RMSUMMARY
+
+    # To enable AppSummaryLogging for the RM,
+    # set yarn.server.resourcemanager.appsummary.logger to
+    # <LEVEL>,RMSUMMARY in hadoop-env.sh
+
+    # Appender for ResourceManager Application Summary Log
+    # Requires the following properties to be set
+    #    - hadoop.log.dir (Hadoop Log directory)
+    #    - yarn.server.resourcemanager.appsummary.log.file (resource manager app summary log filename)
+    #    - yarn.server.resourcemanager.appsummary.logger (resource manager app summary log level and appender)
+
+    log4j.logger.org.apache.hadoop.yarn.server.resourcemanager.RMAppManager$ApplicationSummary=${yarn.server.resourcemanager.appsummary.logger}
+    log4j.additivity.org.apache.hadoop.yarn.server.resourcemanager.RMAppManager$ApplicationSummary=false
+    log4j.appender.RMSUMMARY=org.apache.log4j.RollingFileAppender
+    log4j.appender.RMSUMMARY.File=${hadoop.log.dir}/${yarn.server.resourcemanager.appsummary.log.file}
+    log4j.appender.RMSUMMARY.MaxFileSize=256MB
+    log4j.appender.RMSUMMARY.MaxBackupIndex=20
+    log4j.appender.RMSUMMARY.layout=org.apache.log4j.PatternLayout
+    log4j.appender.RMSUMMARY.layout.ConversionPattern=%d{ISO8601} %p %c{2}: %m%n
+
+    # HS audit log configs
+    #mapreduce.hs.audit.logger=INFO,HSAUDIT
+    #log4j.logger.org.apache.hadoop.mapreduce.v2.hs.HSAuditLogger=${mapreduce.hs.audit.logger}
+    #log4j.additivity.org.apache.hadoop.mapreduce.v2.hs.HSAuditLogger=false
+    #log4j.appender.HSAUDIT=org.apache.log4j.DailyRollingFileAppender
+    #log4j.appender.HSAUDIT.File=${hadoop.log.dir}/hs-audit.log
+    #log4j.appender.HSAUDIT.layout=org.apache.log4j.PatternLayout
+    #log4j.appender.HSAUDIT.layout.ConversionPattern=%d{ISO8601} %p %c{2}: %m%n
+    #log4j.appender.HSAUDIT.DatePattern=.yyyy-MM-dd
+
+    # Http Server Request Logs
+    #log4j.logger.http.requests.namenode=INFO,namenoderequestlog
+    #log4j.appender.namenoderequestlog=org.apache.hadoop.http.HttpRequestLogAppender
+    #log4j.appender.namenoderequestlog.Filename=${hadoop.log.dir}/jetty-namenode-yyyy_mm_dd.log
+    #log4j.appender.namenoderequestlog.RetainDays=3
+
+    #log4j.logger.http.requests.datanode=INFO,datanoderequestlog
+    #log4j.appender.datanoderequestlog=org.apache.hadoop.http.HttpRequestLogAppender
+    #log4j.appender.datanoderequestlog.Filename=${hadoop.log.dir}/jetty-datanode-yyyy_mm_dd.log
+    #log4j.appender.datanoderequestlog.RetainDays=3
+
+    #log4j.logger.http.requests.resourcemanager=INFO,resourcemanagerrequestlog
+    #log4j.appender.resourcemanagerrequestlog=org.apache.hadoop.http.HttpRequestLogAppender
+    #log4j.appender.resourcemanagerrequestlog.Filename=${hadoop.log.dir}/jetty-resourcemanager-yyyy_mm_dd.log
+    #log4j.appender.resourcemanagerrequestlog.RetainDays=3
+
+    #log4j.logger.http.requests.jobhistory=INFO,jobhistoryrequestlog
+    #log4j.appender.jobhistoryrequestlog=org.apache.hadoop.http.HttpRequestLogAppender
+    #log4j.appender.jobhistoryrequestlog.Filename=${hadoop.log.dir}/jetty-jobhistory-yyyy_mm_dd.log
+    #log4j.appender.jobhistoryrequestlog.RetainDays=3
+
+    #log4j.logger.http.requests.nodemanager=INFO,nodemanagerrequestlog
+    #log4j.appender.nodemanagerrequestlog=org.apache.hadoop.http.HttpRequestLogAppender
+    #log4j.appender.nodemanagerrequestlog.Filename=${hadoop.log.dir}/jetty-nodemanager-yyyy_mm_dd.log
+    #log4j.appender.nodemanagerrequestlog.RetainDays=3
+
+
+    # WebHdfs request log on datanodes
+    # Specify -Ddatanode.webhdfs.logger=INFO,HTTPDRFA on datanode startup to
+    # direct the log to a separate file.
+    #datanode.webhdfs.logger=INFO,console
+    #log4j.logger.datanode.webhdfs=${datanode.webhdfs.logger}
+    #log4j.appender.HTTPDRFA=org.apache.log4j.DailyRollingFileAppender
+    #log4j.appender.HTTPDRFA.File=${hadoop.log.dir}/hadoop-datanode-webhdfs.log
+    #log4j.appender.HTTPDRFA.layout=org.apache.log4j.PatternLayout
+    #log4j.appender.HTTPDRFA.layout.ConversionPattern=%d{ISO8601} %m%n
+    #log4j.appender.HTTPDRFA.DatePattern=.yyyy-MM-dd
+
+
+    # Appender for viewing information for errors and warnings
+    yarn.ewma.cleanupInterval=300
+    yarn.ewma.messageAgeLimitSeconds=86400
+    yarn.ewma.maxUniqueMessages=250
+    log4j.appender.EWMA=org.apache.hadoop.yarn.util.Log4jWarningErrorMetricsAppender
+    log4j.appender.EWMA.cleanupInterval=${yarn.ewma.cleanupInterval}
+    log4j.appender.EWMA.messageAgeLimitSeconds=${yarn.ewma.messageAgeLimitSeconds}
+    log4j.appender.EWMA.maxUniqueMessages=${yarn.ewma.maxUniqueMessages}
+
+    #
+    # Fair scheduler state dump
+    #
+    # Use following logger to dump the state to a separate file
+
+    #log4j.logger.org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler.statedump=DEBUG,FSSTATEDUMP
+    #log4j.additivity.org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler.statedump=false
+    #log4j.appender.FSSTATEDUMP=org.apache.log4j.RollingFileAppender
+    #log4j.appender.FSSTATEDUMP.File=${hadoop.log.dir}/fairscheduler-statedump.log
+    #log4j.appender.FSSTATEDUMP.layout=org.apache.log4j.PatternLayout
+    #log4j.appender.FSSTATEDUMP.layout.ConversionPattern=%d{ISO8601} %p %c: %m%n
+    #log4j.appender.FSSTATEDUMP.MaxFileSize=${hadoop.log.maxfilesize}
+    #log4j.appender.FSSTATEDUMP.MaxBackupIndex=${hadoop.log.maxbackupindex}
+
+    # Log levels of third-party libraries
+    log4j.logger.org.apache.commons.beanutils=WARN
